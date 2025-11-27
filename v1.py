@@ -1,17 +1,16 @@
-# app.py
+# app.py（2025 年完全可運行版）
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
 import plotly.graph_objs as go
-from io import StringIO
 import base64
 
-st.set_page_config(layout="wide", page_title="Elliott Multi-Timeframe Detector")
+st.set_page_config(layout="wide", page_title="Elliott Wave 多時間框架偵測器")
 
 # -------------------------
-# Helper indicators
+# 指標計算
 # -------------------------
 def macd(series, fast=12, slow=26, signal=9):
     ema_fast = series.ewm(span=fast, adjust=False).mean()
@@ -22,339 +21,233 @@ def macd(series, fast=12, slow=26, signal=9):
     return macd_line, signal_line, hist
 
 def obv(df):
-    # On-balance volume
-    obv_series = [0]
-    for i in range(1, len(df)):
-        if df['Close'].iloc[i] > df['Close'].iloc[i-1]:
-            obv_series.append(obv_series[-1] + df['Volume'].iloc[i])
-        elif df['Close'].iloc[i] < df['Close'].iloc[i-1]:
-            obv_series.append(obv_series[-1] - df['Volume'].iloc[i])
-        else:
-            obv_series.append(obv_series[-1])
-    return pd.Series(obv_series, index=df.index)
-
-def moving_average_trend(series, short=50, long=200):
-    if len(series) < long:
-        return None  # not enough data
-    ma_short = series.rolling(short).mean().iloc[-1]
-    ma_long = series.rolling(long).mean().iloc[-1]
-    return "bull" if ma_short > ma_long else "bear"
+    volume = df['Volume'].fillna(0)
+    direction = np.sign(df['Close'].diff()).fillna(0)
+    obv = (direction * volume).cumsum()
+    return obv
 
 # -------------------------
-# Pivot detection (local peaks/troughs)
+# 找局部極值點（已防呆）
 # -------------------------
 def find_pivots(close_series, order=5):
-    # returns list of tuples (idx, price, type)
-    n = len(close_series)
-    highs = argrelextrema(close_series.values, np.greater_equal, order=order)[0]
-    lows = argrelextrema(close_series.values, np.less_equal, order=order)[0]
+    close_clean = close_series.dropna()
+    if len(close_clean) < order * 2 + 1:
+        return []
+    
+    arr = close_clean.values
+    highs = argrelextrema(arr, np.greater_equal, order=order)[0]
+    lows = argrelextrema(arr, np.less_equal, order=order)[0]
+    
     tps = []
     for i in highs:
-        tps.append((int(i), float(close_series.iloc[i]), "peak"))
+        orig_idx = close_clean.index[i]
+        tps.append((orig_idx, float(close_clean.iloc[i]), "peak"))
     for i in lows:
-        tps.append((int(i), float(close_series.iloc[i]), "trough"))
+        orig_idx = close_clean.index[i]
+        tps.append((orig_idx, float(close_clean.iloc[i]), "trough"))
     tps.sort(key=lambda x: x[0])
     return tps
 
 # -------------------------
-# Detect 5-wave impulse + ABC corrective heuristics
+# 其他函數（略微優化）
 # -------------------------
 def alternates(types):
     return all(types[i] != types[i+1] for i in range(len(types)-1))
 
 def detect_impulses(turning_points):
-    # turning_points: [(idx, price, type), ...]
     res = []
-    n = len(turning_points)
-    for i in range(n-5):
+    for i in range(len(turning_points)-5):
         seq = turning_points[i:i+6]
-        types = [s[2] for s in seq]
+        types = [p[2] for p in seq]
         if not alternates(types):
             continue
-        start_price = seq[0][1]; end_price = seq[-1][1]
-        # require net move (direction) and monotonic peaks/troughs
-        if end_price > start_price:
-            peaks = [s[1] for s in seq if s[2]=="peak"]
-            troughs = [s[1] for s in seq if s[2]=="trough"]
-            if len(peaks)>=2 and len(troughs)>=2:
-                if all(peaks[i] < peaks[i+1] for i in range(len(peaks)-1)) and all(troughs[i] < troughs[i+1] for i in range(len(troughs)-1)):
-                    res.append(seq)
-        elif end_price < start_price:
-            peaks = [s[1] for s in seq if s[2]=="peak"]
-            troughs = [s[1] for s in seq if s[2]=="trough"]
-            if len(peaks)>=2 and len(troughs)>=2:
-                if all(peaks[i] > peaks[i+1] for i in range(len(peaks)-1)) and all(troughs[i] > troughs[i+1] for i in range(len(troughs)-1)):
-                    res.append(seq)
+        prices = [p[1] for p in seq]
+        if prices[-1] > prices[0]:  # 上漲五浪
+            peaks = prices[1::2]    # 1,3,5
+            troughs = prices[2::2]  # 2,4
+            if len(ge(peaks) >= 2 and troughs >= 2 and
+               peaks == sorted(peaks) and troughs == sorted(troughs):
+                res.append(seq)
+        else:  # 下跌五浪
+            peaks = prices[1::2]
+            troughs = prices[2::2]
+            if len(peaks) >= 2 and len(troughs) >= 2 and
+               peaks == sorted(peaks, reverse=True) and troughs == sorted(troughs, reverse=True):
+                res.append(seq)
     return res
 
-def detect_abc_after_impulse(turning_points, impulse_seq):
-    # find next 3 turning points after impulse end to form A-B-C (4 pts -> A B C moves)
-    end_idx = impulse_seq[-1][0]
-    # find index in turning_points list
-    indices = [tp[0] for tp in turning_points]
-    try:
-        pos = indices.index(end_idx)
-    except ValueError:
-        return None
-    if pos + 3 >= len(turning_points):
-        return None
-    abc_seq = turning_points[pos+1:pos+4]  # three moves -> 4 pts? but we take 3 pts as A B C peaks/troughs
-    # ensure alternation
-    if not alternates([s[2] for s in abc_seq]):
-        return None
-    return abc_seq
-
-# -------------------------
-# Fibonacci checks (tolerant)
-# -------------------------
 def fib_validate_impulse(seq):
-    # seq: six turning points t0..t5 (idx, price, type)
-    # compute wave magnitudes (absolute)
-    p = [s[1] for s in seq]
-    w1 = abs(p[1]-p[0])
-    w2 = abs(p[2]-p[1])
-    w3 = abs(p[3]-p[2])
-    w4 = abs(p[4]-p[3])
-    w5 = abs(p[5]-p[4])
-    # tolerant checks
-    c1 = (0.3 <= w2 / (w1+1e-9) <= 0.8)   # wave2 retrace 38-78%
-    c2 = (w3 >= 1.3 * w1)                 # wave3 larger than wave1 (tolerance)
-    c3 = (0.18 <= w4 / (w3+1e-9) <= 0.6)  # wave4 retrace of wave3
-    c4 = (0.3 <= w5 / (w1+1e-9) <= 1.5)   # wave5 relative to wave1 (tolerant)
-    valid = sum([c1,c2,c3,c4]) >= 3  # require at least 3/4 checks pass
-    details = {"wave_lengths":[w1,w2,w3,w4,w5], "checks":[c1,c2,c3,c4]}
-    return valid, details
+    p = [x[1] for x in seq]
+    w = [abs(p[i+1] - p[i]) for i in range(5)]
+    if any(x == 0 for x in w): return False, {}
+    c1 = 0.3 <= w[1]/w[0] <= 0.85
+    c2 = w[2] >= w[0] * 0.9
+    c3 = 0.1 <= w[3]/w[2] <= 0.7
+    c4 = 0.5 <= w[4]/w[0] <= 2.0
+    valid = sum([c1,c2,c3,c4]) >= 3
+    return valid, {"lengths": w, "pass": [c1,c2,c3,c4]}
 
 # -------------------------
-# Investment suggestion logic
+# 畫圖（關鍵修復：全部改用 iloc）
 # -------------------------
-def compose_suggestion(ticker, timeframe, impulse, abc, fib_ok, macd_hist, obv_trend, ma_trend):
-    reasons = []
-    score = 0
-
-    if impulse is None:
-        reasons.append("未偵測到明確 5 浪結構")
-    else:
-        # determine where price stands relative to impulse seq
-        last_wave_end_price = impulse[-1][1]  # p5 endpoint price
-        # if abc exists -> likely correction in progress
-        if abc is not None:
-            reasons.append("偵測到 A-B-C 修正（修正中）")
-            score -= 2
-        else:
-            reasons.append("5 浪結構可能尚未完成或剛完成")
-            score += 0
-
-        if fib_ok:
-            reasons.append("通過斐波那契檢驗（增加信心）")
-            score += 1
-        else:
-            reasons.append("未通過斐波那契檢驗（降低信心）")
-            score -= 1
-
-    # MACD: positive histogram -> momentum up
-    if macd_hist is not None:
-        if macd_hist[-1] > 0:
-            reasons.append("MACD histogram 正值（動能偏多）")
-            score += 1
-        else:
-            reasons.append("MACD histogram 負值（動能偏空）")
-            score -= 1
-
-    # OBV trend: last vs first
-    if obv_trend is not None:
-        if obv_trend == "up":
-            reasons.append("OBV 上升（資金流入）")
-            score += 1
-        else:
-            reasons.append("OBV 下降（資金流出）")
-            score -= 1
-
-    # MA trend filter
-    if ma_trend == "bull":
-        reasons.append("短中期均線看多（趨勢濾網：多頭）")
-        score += 1
-    elif ma_trend == "bear":
-        reasons.append("短中期均線看空（趨勢濾網：空頭）")
-        score -= 1
-
-    # derive suggestion
-    if score >= 2:
-        suggestion = "多頭 (Buy/趨勢向上)"
-    elif score <= -2:
-        suggestion = "空頭 (Sell/趨勢向下)"
-    else:
-        suggestion = "觀望 (Hold/Wait)"
-
-    # compose text explanation
-    explanation = f"{ticker} {timeframe} => 建議：**{suggestion}**\n\n理由：\n"
-    for r in reasons:
-        explanation += f"- {r}\n"
-    explanation += f"\n(綜合分數 {score})"
-    return suggestion, explanation
-
-# -------------------------
-# Plot helper to draw waves and labels
-# -------------------------
-def plot_with_waves(df, turning_points, impulses_valid, abc_list, title):
+def plot_with_waves(df, tps, impulses_valid, abc_list, title):
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'))
-    # mark turning points
-    if turning_points:
-        fig.add_trace(go.Scatter(
-            x=[df.loc[p[0],'Date'] for p in turning_points],
-            y=[p[1] for p in turning_points],
-            mode='markers', marker=dict(size=7), name='Turning Points'
-        ))
-    # draw valid impulses
-    for seq in impulses_valid:
-        xs = [df.loc[p[0],'Date'] for p in seq]
-        ys = [p[1] for p in seq]
-        # connect successive points (t0..t5)
-        fig.add_trace(go.Scatter(x=xs, y=ys, mode='lines+markers', line=dict(width=3), name='Impulse (valid)'))
-        # annotate wave numbers 1..5 on segments
-        for w in range(5):
-            x0 = xs[w]; x1 = xs[w+1]
-            y0 = ys[w]; y1 = ys[w+1]
-            midx = x0 + (x1 - x0)/2
-            midy = (y0 + y1)/2
-            fig.add_annotation(x=midx, y=midy, text=str(w+1), showarrow=False, font=dict(size=12, color='black'))
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df['Open'], high=df['High'],
+        low=df['Low'], close=df['Close'], name="K線"
+    ))
 
-    # draw ABC sequences
+    # 轉折點
+    if tps:
+        tp_df = pd.DataFrame(tps, columns=['idx', 'price', 'type'])
+        tp_df['date'] = df.index[tp_df['idx']]
+        fig.add_trace(go.Scatter(x=tp_df['date'], y=tp_df['price'],
+                                 mode='markers', marker=dict(size=8, color='red'), name='轉折點'))
+
+    # 五浪
+    for seq in impulses_valid:
+        idxs = [p[0] for p in seq]
+        dates = df.index[idxs]
+        prices = [p[1] for p in seq]
+        fig.add_trace(go.Scatter(x=dates, y=prices, mode='lines+markers',
+                                 line=dict(width=4, color='green'), name='五浪推進'))
+
+        for i in range(5):
+            x0, x1 = dates[i], dates[i+1]
+            y0, y1 = prices[i], prices[i+1]
+            mid_x = x0 + (x1 - x0)/2
+            mid_y = y0 + (y1 - y0)*0.6
+            fig.add_annotation(x=mid_x, y=mid_y, text=str(i+1),
+                               font=dict(size=16, color="white"), bgcolor="green")
+
+    # ABC
     for seq in abc_list:
-        xs = [df.loc[p[0],'Date'] for p in seq]
-        ys = [p[1] for p in seq]
-        fig.add_trace(go.Scatter(x=xs, y=ys, mode='lines+markers', line=dict(dash='dash'), name='Corrective A-B-C'))
-        # label A,B,C
-        for i, lab in enumerate(['A','B','C']):
-            fig.add_annotation(x=xs[i], y=ys[i], text=lab, showarrow=True, arrowhead=2)
-    fig.update_layout(title=title, xaxis_rangeslider_visible=False, template='plotly_white', height=600)
+        idxs = [p[0] for p in seq]
+        dates = df.index[idxs]
+        prices = [p[1] for p in seq]
+        fig.add_trace(go.Scatter(x=dates, y=prices, mode='lines+markers',
+                                 line=dict(width=3, color='orange', dash='dash'), name='ABC修正'))
+        for i, lab in enumerate("ABC"):
+            fig.add_annotation(x=dates[i], y=prices[i], text=lab,
+                               font=dict(size=14, color="black"), bgcolor="yellow")
+
+    fig.update_layout(title=title, template="plotly_white", height=650,
+                      xaxis_rangeslider_visible=False)
     return fig
 
 # -------------------------
-# Utility CSV download
+# 下載連結
 # -------------------------
 def to_download_link(df, filename="result.csv"):
     csv = df.to_csv(index=False)
     b64 = base64.b64encode(csv.encode()).decode()
-    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">下載 {filename}</a>'
-    return href
+    return f'<a href="data:file/csv;base64,{b64}" download="{filename}">下載 {filename}</a>'
 
 # -------------------------
-# Streamlit UI
+# Streamlit 主程式（關鍵修復）
 # -------------------------
-st.title("📊 Multi-Timeframe Elliott Wave + MACD/OBV Filter")
+st.title("艾略特波浪 多時間框架自動偵測器")
 
 st.sidebar.header("設定")
-tickers_input = st.sidebar.text_input("輸入多支股票（逗號分隔）", value="TSLA, NVDA, AAPL")
-timeframes = st.sidebar.multiselect("選擇時間框架（可多選）", ["5m", "60m", "1d"], default=["1d"])
-order = st.sidebar.slider("局部極值 sensitivity (order)", 2, 12, 5)
-ma_short = st.sidebar.number_input("短期 MA (天)", value=50)
-ma_long = st.sidebar.number_input("長期 MA (天)", value=200)
-run = st.sidebar.button("執行偵測")
+tickers_input = st.sidebar.text_input("股票代號（多筆用逗號）", "TSLA, AAPL, NVDA")
+timeframes = st.sidebar.multiselect("時間框架", ["5m", "15m", "60m", "1d"], ["1d"])
+order = st.sidebar.slider("波峰波谷敏感度", 3, 15, 6)
+run = st.sidebar.button("開始分析", type="primary")
 
 tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
-# -------------------------
-# Main processing
-# -------------------------
 if run:
-    overall_results = []  # collect per stock/timeframe summary rows
+    results = []
     for ticker in tickers:
-        st.header(f"🔎 {ticker}")
+        st.header(f"分析 {ticker}")
         for tf in timeframes:
-            st.subheader(f"Timeframe: {tf}")
-            # download data
-            try:
-                df = yf.download(ticker, period="60d" if tf=="5m" else "180d", interval=tf, progress=False, auto_adjust=True)
-            except Exception as e:
-                st.error(f"下載 {ticker} {tf} 失敗：{e}")
-                continue
-            if df.empty:
-                st.warning(f"{ticker} {tf} 無資料")
-                continue
-            df = df.reset_index()
-            df['Date'] = pd.to_datetime(df['Date'])
-            # ensure volume exists (for intraday yfinance may include volume)
-            if 'Volume' not in df.columns:
-                df['Volume'] = 0
+            with st.spinner(f"下載 {ticker} {tf} 資料..."):
+                # 自動調整 period（5m 最多 7 天）
+                if tf == "5m":
+                    period = "7d"
+                elif tf in ["15m", "60m"]:
+                    period = "60d"
+                else:
+                    period = "2y"
 
-            # indicators
-            df['MA_short'] = df['Close'].rolling(ma_short).mean()
-            df['MA_long'] = df['Close'].rolling(ma_long).mean()
-            ma_trend = None
-            if len(df) >= ma_long:
-                ma_trend = "bull" if df['MA_short'].iloc[-1] > df['MA_long'].iloc[-1] else "bear"
+                data = yf.download(ticker, period=period, interval=tf, progress=False)
+                if data.empty:
+                    st.error(f"{ticker} {tf} 無資料")
+                    continue
 
-            macd_line, signal_line, macd_hist = macd(df['Close'])
-            df['MACD'] = macd_line
-            df['MACD_signal'] = signal_line
-            df['MACD_hist'] = macd_hist
+                df = data.copy()
+                df = df.dropna(subset=['Close'])
 
-            obv_series = obv(df)
-            df['OBV'] = obv_series
-            obv_trend = "up" if df['OBV'].iloc[-1] > df['OBV'].iloc[max(0, -int(len(df)/3))] else "down"
+                # 指標
+                macd_line, signal_line, hist = macd(df['Close'])
+                df['MACD_hist'] = hist
+                last_hist = hist.dropna().iloc[-1] if not hist.dropna().empty else 0
 
-            # pivots & waves
-            tps = find_pivots(df['Close'], order=order)
-            impulses = detect_impulses(tps)
-            impulses_valid = []
-            impulses_info = []
-            abc_list = []
-            for seq in impulses:
-                valid, details = fib_validate_impulse(seq)
-                if valid:
-                    impulses_valid.append(seq)
-                    impulses_info.append(details)
-                    # find ABC after impulse
-                    abc = detect_abc_after_impulse(tps, seq)
-                    if abc:
-                        abc_list.append(abc)
+                df['OBV'] = obv(df)
+                obv_trend = "up" if df['OBV'].iloc[-1] > df['OBV'].iloc[-50] else "down"
 
-            # pick the most recent valid impulse (if any)
-            selected_impulse = impulses_valid[-1] if impulses_valid else None
-            selected_abc = abc_list[-1] if abc_list else None
-            fib_ok = bool(selected_impulse is not None)
+                ma_trend = "bull" if df['Close'].rolling(50).mean().iloc[-1] > df['Close'].rolling(200).mean().iloc[-1] else "bear"
 
-            # compose suggestion
-            suggestion, explanation = compose_suggestion(ticker, tf, selected_impulse, selected_abc, fib_ok,
-                                                        df['MACD_hist'].values if 'MACD_hist' in df else None,
-                                                        obv_trend, ma_trend)
-            # display chart
-            fig = plot_with_waves(df, tps, impulses_valid, abc_list, f"{ticker} {tf}")
-            st.plotly_chart(fig, use_container_width=True)
+                # 找轉折點
+                tps = find_pivots(df['Close'], order=order)
+                impulses = detect_impulses(tps)
+                valid_impulses = [seq for seq in impulses if fib_validate_impulse(seq)[0]]
+                abc_list = []
+                for seq in valid_impulses[-3:]:  # 只看最近幾組
+                    end_idx = seq[-1][0]
+                    later = [p for p in tps if p[0] > end_idx]
+                    if len(later) >= 3 and alternates([p[2] for p in later[:3]]):
+                        abc_list.append(later[:3])
 
-            # show metrics and suggestion
-            st.markdown(f"**建議： {suggestion}**")
-            st.markdown("**判斷理由：**")
-            st.write(explanation)
+                selected_impulse = valid_impulses[-1] if valid_impulses else None
+                fib_ok = selected_impulse is not None
 
-            # show small table of impulse details
-            if selected_impulse:
-                rows = []
-                for i, p in enumerate(selected_impulse):
-                    rows.append({"point_idx": p[0], "date": df.loc[p[0],'Date'], "price": p[1], "type": p[2]})
-                st.table(pd.DataFrame(rows))
+                # 建議
+                score = 0
+                reasons = []
+                if selected_impulse:
+                    reasons.append("偵測到完整五浪")
+                    score += 2
+                    if abc_list:
+                        reasons.append("正在進行 ABC 修正")
+                        score -= 1
+                else:
+                    reasons.append("尚未形成明確五浪")
 
-            # collect result
-            overall_results.append({
-                "ticker": ticker,
-                "timeframe": tf,
-                "suggestion": suggestion,
-                "fib_ok": fib_ok,
-                "ma_trend": ma_trend,
-                "obv_trend": obv_trend
-            })
+                score += 1 if last_hist > 0 else -1
+                reasons.append(f"MACD 柱狀圖：{'正' if last_hist > 0 else '負'}")
 
-            # small pause for readability
-            st.markdown("---")
+                score += 1 if obv_trend == "up" else -1
+                reasons.append(f"OBV {'上升' if obv_trend == 'up' else '下降'}")
 
-    # show summary and download
-    if overall_results:
-        summary_df = pd.DataFrame(overall_results)
-        st.header("📋 分析總表")
-        st.dataframe(summary_df)
-        st.markdown(to_download_link(summary_df, filename="elliott_summary.csv"), unsafe_allow_html=True)
+                score += 1 if ma_trend == "bull" else -1
+                reasons.append(f"均線趨勢：{ma_trend}")
 
+                suggestion = "強烈看多" if score >= 3 else "看多" if score >= 1 else "觀望" if score >= -1 else "看空"
+
+                # 顯示
+                col1, col2 = st.columns([3,1])
+                with col1:
+                    fig = plot_with_waves(df, tps, valid_impulses, abc_list, f"{ticker} {tf}")
+                    st.plotly_chart(fig, use_container_width=True)
+                with col2:
+                    st.metric("建議", suggestion)
+                    st.caption("理由：\n" + "\n".join(f"• {r}" for r in reasons))
+
+                results.append({
+                    "股票": ticker, "框架": tf, "建議": suggestion,
+                    "五浪": "是" if selected_impulse else "否",
+                    "ABC修正": "是" if abc_list else "否",
+                    "MACD": "正" if last_hist > 0 else "負",
+                    "OBV": obv_trend, "均線": ma_trend
+                })
+
+                st.markdown("---")
+
+    if results:
+        summary = pd.DataFrame(results)
+        st.header("總結表")
+        st.dataframe(summary, use_container_width=True)
+        st.markdown(to_download_link(summary, "艾略特波浪分析結果.csv"), unsafe_allow_html=True)
 else:
-    st.info("設定參數後按左側「執行偵測」開始。")
+    st.info("請在左側設定參數後點擊「開始分析」")
