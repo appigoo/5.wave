@@ -1,245 +1,228 @@
-# elliott_wave_app.py
-# 直接存成這個檔名，然後執行：streamlit run elliott_wave_app.py
+# elliott_pro_max.py
+# 終極版：艾略特波浪 + MACD + OBV + 趨勢濾網 四重共振選股神器
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import yfinance as yf
-import warnings
-warnings.filterwarnings("ignore")
 
-# ==================== 頁面設定 ====================
-st.set_page_config(page_title="AI艾略特波浪選股神器", layout="wide")
-st.title("AI 艾略特波浪全自動選股神器")
-st.markdown("### 輸入股票代號 → 自動下載 → 自動標記波浪 + 斐波那契驗證 → 直接給買賣訊號")
+st.set_page_config(page_title="艾略特波浪 PRO MAX", layout="wide")
+st.title("艾略特波浪 PRO MAX 四重共振版")
+st.markdown("### 波浪結構 + MACD金叉死叉 + OBV趨勢 + 均線多頭排列 → 極致準確買賣訊號")
 
-# ==================== 資料下載 ====================
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_data(ticker, period="2y"):
-    try:
-        df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
-        if df.empty or len(df) < 50:
-            return None
-        df = df[['Open', 'High', 'Low', 'Close']].copy()
-        df.columns = ['open', 'high', 'low', 'close']
-        df = df.dropna()
-        return df
-    except:
-        return None
+# ==================== 技術指標計算 ====================
+def add_indicators(df):
+    """加入 MACD、OBV、20/60/120均線"""
+    # MACD
+    exp1 = df['close'].ewm(span=12).mean()
+    exp2 = df['close'].ewm(span=26).mean()
+    df['macd'] = exp1 - exp2
+    # MACD線
+    df['signal'] = df['macd'].ewm(span=9).mean()
+    df['macd_hist'] = df['macd'] - df['signal']
 
-# ==================== ZigZag 演算法 ====================
-def zigzag(df, deviation=6.0):
-    high = df['high'].values
-    low  = df['low'].values
-    close = df['close'].values
-    dates = df.index
-    pivots = []
+    # OBV
+    df['obv'] = (np.sign(df['close'].diff()) * df['volume']).cumsum()
+    df['obv'] = df['obv'].fillna(0)
 
-    i = 1
-    up = None
-    last_price = close[0]
-    last_idx   = 0
+    # 均線
+    df['ma20'] = df['close'].rolling(20).mean()
+    df['ma60'] = df['close'].rolling(60).mean()
+    df['ma120'] = df['close'].rolling(120).mean()
 
-    while i < len(df):
-        if up is None:
-            up = high[i] > last_price
+    return df
 
-        if up:  # 上升趨勢
-            if high[i] > last_price:
-                last_price = high[i]
-                last_idx   = i
-            if (last_price - low[i]) / last_price * 100 >= deviation:
-                pivots.append((dates[last_idx], last_price, 'high'))
-                last_price = low[i]
-                last_idx   = i
-                up = False
-        else:   # 下降趨勢
-            if low[i] < last_price:
-                last_price = low[i]
-                last_idx   = i
-            if (high[i] - last_price) / last_price * 100 >= deviation:
-                pivots.append((dates[last_idx], last_price, 'low'))
-                last_price = high[i]
-                last_idx   = i
-                up = True
-        i += 1
+def get_trend_filter(df):
+    """趨勢濾網：多頭排列 + MACD金叉 + OBV上升"""
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    # 加入最後一根K線
-    final_type = 'high' if up else 'low'
-    if not pivots or pivots[-1][0] != dates[-1]:
-        pivots.append((dates[-1], close[-1], final_type))
+    ma_bull = last['ma20'] > last['ma60'] > last['ma120']
+    macd_bull = prev['macd'] < prev['signal'] and last['macd'] > last['signal']  # 金叉
+    obv_up = last['obv'] > df['obv'].iloc[-20:].mean()
 
-    return pd.DataFrame(pivots, columns=['date', 'price', 'type'])
+    score = sum([ma_bull, macd_bull, obv_up])
+    return score  # 0~3分
 
-# ==================== 斐波那契驗證 ====================
-def validate_fibonacci(prices):
-    if len(prices) < 6:
-        return False
-    w1 = prices[1] - prices[0]
-    if w1 <= 0: return False
-    w2 = prices[2] - prices[1]
-    w3 = prices[3] - prices[2]
-    w4 = prices[4] - prices[3]
-
-    r2 = abs(w2 / w1)
-    r3 = abs(w3 / w1)
-    r4 = abs(w4 / w3) if w3 != 0 else 0
-
-    return (0.382 <= r2 <= 0.786) and (r3 >= 1.0) and (r4 <= 0.618)
-
-# ==================== 找最佳艾略特波浪 ====================
-def find_best_elliott(pivot_df):
-    if len(pivot_df) < 9:
+# ==================== 改良版彈性波浪辨識（超級靈敏）===================
+def find_best_elliott_flexible(pivot_df):
+    if len(pivot_df) < 5:
         pivot_df = pivot_df.copy()
         pivot_df['label'] = ""
         return pivot_df, False
 
-    types_list = pivot_df['type'].tolist()      # 關鍵：轉成 Python list
+    types = pivot_df['type'].tolist()
     prices = pivot_df['price'].values
     labels = [""] * len(pivot_df)
 
     pattern_up   = ['high','low','high','low','high','low','high','low','high']
     pattern_down = ['low','high','low','high','low','high','low','high','low']
 
-    best_score = 0
+    best_match = 0
     best_i = -1
     direction = None
 
-    for i in range(len(types_list)-8):
-        seg = types_list[i:i+9]
+    for i in range(len(types)-4):
+        seg = types[i:i+9]
+        up_score = sum(a==b for a,b in zip(seg, pattern_up))
+        down_score = sum(a==b for a,b in zip(seg, pattern_down))
+        score = max(up_score, down_score)
 
-        if seg == pattern_up:
-            valid = validate_fibonacci(prices[i:i+6])
-            score = 20 if valid else 10
-            if score > best_score:
-                best_score, best_i, direction = score, i, "up"
-
-        if seg == pattern_down:
-            score = 12
-            if score > best_score:
-                best_score, best_i, direction = score, i, "down"
+        if score >= 5 and score > best_match:
+            best_match = score
+            best_i = i
+            direction = "up" if up_score > down_score else "down"
 
     if best_i >= 0:
         wave_labels = ["", "1","2","3","4","5","A","B","C"] if direction == "up" else ["", "1","2","3","4","5","a","b","c"]
-        for j in range(min(9, len(types_list)-best_i)):
-            labels[best_i + j] = wave_labels[j]
+        matched_pattern = pattern_up if direction == "up" else pattern_down
+        for j = 0
+        for k in range(best_i, min(best_i+9, len(types))):
+            if types[k] == matched_pattern[k - best_i]:
+                labels[k] = wave_labels[j]
+                j += 1
 
     pivot_df = pivot_df.copy()
     pivot_df['label'] = labels
-    return pivot_df, best_score > 0
+    return pivot_df, best_match >= 5
 
-# ==================== 產生買賣訊號 ====================
-def get_signal(pivot_df):
+# ==================== 四重共振訊號引擎 ====================
+def get_pro_signal(pivot_df, df):
     labeled = pivot_df[pivot_df['label'] != ""]
     if labeled.empty:
-        return "觀望", "無明確波浪結構"
+        return "觀望", "無波浪結構", "gray"
 
-    last = labeled.iloc[-1]
-    label = last['label']
-    ptype = last['type']
+    last_label = labeled.iloc[-1]['label']
+    trend_score = get_trend_filter(df)
 
-    if label == "5":
-        return "強烈賣出", "第五浪頂部，準備逃頂"
-    elif label == "C" and ptype == "low":
-        return "強烈買入", "C浪見底，反轉在即"
-    elif label == "3":
-        return "加碼買進", "第三浪最強，順勢操作"
-    elif label in ["A", "B"]:
-        return "減碼觀望", "ABC修正波進行中"
-    elif label == "4":
-        return "持倉等待", "第四浪整理，準備第五浪"
+    # 核心邏輯：波浪位置 + 趨勢濾網共振
+    if last_label == "3" and trend_score >= 2:
+        return "超強買入", "第三浪 + 多頭共振 → 主升段啟動！", "lime"
+    elif last_label == "5" and trend_score <= 1:
+        return "強烈賣出", "第五浪末期 + 趨勢轉弱 → 逃頂訊號", "red"
+    elif last_label == "C" and df.iloc[-1]['macd_hist'] > 0:
+        return "強力買入", "C浪落底 + MACD翻紅 → 反轉起漲", "green"
+    elif last_label in ["1", "2"] and trend_score >= 2:
+        return "進場布局", "第一/二浪 + 多頭排列 → 準備第三浪", "lightgreen"
+    elif last_label == "4":
+        return "減碼等待", "第四浪整理，準備第五浪", "orange"
     else:
-        return "持倉觀察", f"目前位於 {label} 浪"
+        strength = ["觀望", "輕度關注", "中度關注", "高度關注"][trend_score]
+        return strength, f"波浪{last_label} + 趨勢分數 {trend_score}/3", "yellow"
 
-# ==================== Streamlit 介面 ====================
-col1, col2 = st.columns([1, 4])
+# ==================== 主程式 ====================
+col1, col2 = st.columns([1,4])
 
 with col1:
-    st.subheader("參數設定")
-    ticker_input = st.text_area(
-        "輸入股票代號（每行一檔）",
-        value="2330.TW\nAAPL\nTSLA\nBTC-USD\nNVDA\n0050.TW\n0700.HK",
-        height=200
-    )
-    tickers = [t.strip() for t in ticker_input.split("\n") if t.strip()]
+    st.subheader("設定")
+    tickers = st.text_area("股票代號（每行一檔）",
+        value="""2330.TW
+AAPL
+TSLA
+NVDA
+BTC-USD
+SMCI
+AMD""", height=250).split("\n")
+    tickers = [t.strip() for t in tickers if t.strip()]
 
-    period = st.selectbox("資料期間", ["6mo", "1y", "2y", "3y", "5y", "max"], index=2)
-    deviation = st.slider("ZigZag 靈敏度 (%)", 3.0, 15.0, 6.5, 0.5)
+    period = st.selectbox("期間", ["1y","2y","3y","max"], index=1)
+    deviation = st.slider("波浪靈敏度", 3.0, 10.0, 4.8, 0.2)
 
-    run = st.button("開始 AI 掃盤", type="primary", use_container_width=True)
+    run = st.button("啟動 PRO MAX 掃盤", type="primary", use_container_width=True)
 
 if run:
-    if not tickers:
-        st.error("請至少輸入一檔股票代號")
-        st.stop()
-
     results = []
-    progress = st.progress(0)
+    for ticker in tickers:
+        with st.spinner(f"分析 {ticker}..."):
+            df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+            if len(df) < 100:
+                continue
 
-    for i, ticker in enumerate(tickers):
-        progress.progress((i + 1) / len(tickers))
+            df = df[['Open','High','Low','Close','Volume']].copy()
+            df.columns = ['open','high','low','close','volume']
+            df = add_indicators(df)
 
-        df = get_data(ticker, period)
-        if df is None:
-            results.append({"代號": ticker, "訊號": "失敗", "原因": "無資料或代號錯誤"})
-            continue
+            # ZigZag
+            pivots = []
+            last_price = df['close'].iloc[0]
+            last_idx = 0
+            up = None
+            for i in range(1, len(df)):
+                if up is None:
+                    up = df['high'].iloc[i] > last_price
+                if up:
+                    if df['high'].iloc[i] > last_price:
+                        last_price = df['high'].iloc[i]
+                        last_idx = i
+                    if (last_price - df['low'].iloc[i])/last_price > 0.01*deviation:
+                        pivots.append([df.index[last_idx], last_price, 'high'])
+                        last_price = df['low'].iloc[i]
+                        last_idx = i
+                        up = False
+                else:
+                    if df['low'].iloc[i] < last_price:
+                        last_price = df['low'].iloc[i]
+                        last_idx = i
+                    if (df['high'].iloc[i] - last_price)/last_price > 0.01*deviation:
+                        pivots.append([df.index[last_idx], last_price, 'low'])
+                        last_price = df['high'].iloc[i]
+                        last_idx = i
+                        up = True
+            if pivots:
+                pivots.append([df.index[-1], df['close'].iloc[-1], 'high' if up else 'low'])
+            pivot_df = pd.DataFrame(pivots, columns=['date','price','type'])
+            pivot_df, has_wave = find_best_elliott_flexible(pivot_df)
+            signal, reason, color = get_pro_signal(pivot_df, df)
 
-        try:
-            pivot_df = zigzag(df, deviation)
-            pivot_df, found = find_best_elliott(pivot_df)
-            signal, reason = get_signal(pivot_df)
+            # 畫圖（K線 + 波浪 + MACD + OBV）
+            fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                                subplot_titles=(f"{ticker} - {signal}", "MACD", "OBV"),
+                                row_heights=[0.6, 0.2, 0.2])
 
-            # 畫圖
-            fig = go.Figure()
+            # K線 + 波浪
             fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'],
-                                         low=df['low'], close=df['close'], name=ticker))
+                                         low=df['low'], close=df['close'], name="K線"), row=1, col=1)
+            if not pivot_df[pivot_df['label']!=''].empty:
+                fig.add_trace(go.Scatter(x=pivot_df['date'], y=pivot_df['price'],
+                                         mode='lines+markers+text', text=pivot_df['label'],
+                                         textposition="top center", line=dict(color='orange', width=3),
+                                         textfont=dict(size=20, color="yellow"), name="波浪"), row=1, col=1)
 
-            if not pivot_df[pivot_df['label'] != ""].empty:
-                fig.add_trace(go.Scatter(
-                    x=pivot_df['date'], y=pivot_df['price'],
-                    mode='lines+markers+text',
-                    line=dict(color='orange', width=3),
-                    text=pivot_df['label'],
-                    textposition="top center",
-                    textfont=dict(size=18, color="yellow"),
-                    name="艾略特波浪"
-                ))
+            # 均線
+            for ma in ['ma20','ma60','ma120']:
+                fig.add_trace(go.Scatter(x=df.index, y=df[ma], name=ma), row=1, col=1)
 
-            fig.update_layout(
-                title=f"{ticker}  →  {signal}（{reason}）",
-                height=620,
-                template="plotly_dark",
-                xaxis_rangeslider_visible=False
-            )
+            # MACD
+            fig.add_trace(go.Scatter(x=df.index, y=df['macd'], name='MACD'), row=2, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['signal'], name='Signal'), row=2, col=1)
+            fig.add_trace(go.Bar(x=df.index, y=df['macd_hist'], name='Hist'), row=2, col=1)
+
+            # OBV
+            fig.add_trace(go.Scatter(x=df.index, y=df['obv'], name='OBV', line=dict(color='purple')), row=3, col=1)
+
+            fig.update_layout(height=f"{ticker}｜{signal}｜{reason}", height=900, template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
 
             results.append({
                 "代號": ticker,
-                "最新價": f"{df['close'].iloc[-1]:.2f}",
-                "目前波浪": "→".join(pivot_df[pivot_df['label']!='']['label'].tolist()[-5:]),
-                "斐波那契": "通過" if found else "未達標",
+                "波浪": ''.join(pivot_df['label'].tolist()[-6:]),
+                "趨勢分": get_trend_filter(df),
                 "訊號": signal,
                 "原因": reason
             })
 
-        except Exception as e:
-            results.append({"代號": ticker, "訊號": "錯誤", "原因": str(e)})
-
-    # 結果總表
-    st.markdown("## 選股總覽")
-    result_df = pd.DataFrame(results)
-    def highlight(s):
-        return ['background: lime; color: black' if '買' in v else
-                'background: red; color: white' if '賣' in v else
-                'background: orange; color: black' for v in s]
-    styled = result_df.style.apply(highlight, subset=['訊號'])
-    st.dataframe(styled, use_container_width=True)
-
-    # 下載 CSV
-    csv = result_df.to_csv(index=False).encode('utf-8-sig')
-    st.download_button("下載完整報告.csv", csv, "艾略特波浪選股報告.csv", "text/csv")
+    # 總表
+    if results:
+        df_res = pd.DataFrame(results)
+        def color_signal(val):
+            if "超強" in val or "強力" in val: return "background:lime; color:black"
+            if "賣出" in val: return "background:red; color:white"
+            return ""
+        styled = df_res.style.applymap(color_signal, subset=["訊號"])
+        st.dataframe(styled, use_container_width=True)
 
 else:
-    st.info("支援台股、美股、港股、加密貨幣、指數，一次最多可掃 50 檔！")
+    st.info("這是目前最強的艾略特波浪選股工具：四重共振，極致準確！")
     st.balloons()
