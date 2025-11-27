@@ -1,5 +1,5 @@
-# elliott_final_perfect.py
-# 真正的終極版：艾略特波浪 + 五重共振 + 嚴格斐波那契黃金比例驗證
+# elliott_ultimate_final.py
+# 艾略特波浪 五重共振 + 嚴格斐波那契黃金比例 真正的最終版
 
 import streamlit as st
 import pandas as pd
@@ -18,10 +18,10 @@ def validate_fibonacci(prices):
     if len(prices) < 6:
         return False, "點數不足"
     p = prices[:6]
-    w1 = p[2] - p[1]   # 波1
-    w2 = p[1] - p[3]   # 波2回檔
-    w3 = p[4] - p[3]   # 波3
-    w4 = p[3] - p[5]   # 波4回檔
+    w1 = p[2] - p[1]      # 波1
+    w2 = p[1] - p[3]      # 波2回檔
+    w3 = p[4] - p[3]      # 波3
+    w4 = p[3] - p[5]      # 波4回檔
     w5 = p[5] - p[4] if len(prices) > 5 else 0
 
     if w1 <= 0:
@@ -33,16 +33,16 @@ def validate_fibonacci(prices):
     r5 = abs(w5) / w1 if w1 != 0 else 0
 
     checks = [
-        0.35 <= r2 <= 0.79,           # 波2回檔合理
-        r3 >= 1.0,                    # 波3最長
-        r4 <= 0.55,                   # 波4淺
-        r5 >= 0.5 and r5 <= 2.5,      # 波5合理範圍
-        w3 >= w1 and w3 >= abs(w5)    # 波3不能最短
+        0.35 <= r2 <= 0.79,
+        r3 >= 1.0,
+        r4 <= 0.55,
+        r5 >= 0.5 and r5 <= 2.5,
+        w3 >= w1 and w3 >= abs(w5)
     ]
     passed = sum(checks)
     return passed >= 4, f"波2{r2:.1%} 波3{r3:.2f}x 波4{r4:.1%} 波5{r5:.1%} ({passed}/5)"
 
-# ==================== 指標計算 ====================
+# ==================== 技術指標 ====================
 def add_indicators(df):
     df = df.copy()
     exp12 = df['close'].ewm(span=12, adjust=False).mean()
@@ -95,7 +95,7 @@ def zigzag(df, deviation=4.8):
 
     return pd.DataFrame(pivots, columns=['date', 'price', 'type'])
 
-# ==================== 波浪 + 斐波那契辨識 ====================
+# ==================== 找完美波浪 ====================
 def find_golden_wave(pivot_df):
     if len(pivot_df) < 6:
         pivot_df['label'] = ""
@@ -118,7 +118,7 @@ def find_golden_wave(pivot_df):
             if valid:
                 best_i = i
                 best_is_golden = True
-                break  # 找到第一個完美波浪就用
+                break
 
     if best_i >= 0:
         labels[best_i:best_i+6] = ["", "1","2","3","4","5"]
@@ -134,7 +134,9 @@ def find_golden_wave(pivot_df):
 # ==================== 最終訊號 ====================
 def get_signal(pivot_df, df):
     has_golden = pivot_df['golden'].any()
-    last_wave = pivot_df[pivot_df['label'] != ""].iloc[-1]['label'] if not pivot_df[pivot_df['label'] != ""].empty else ""
+    last_wave = ""
+    if not pivot_df[pivot_df['label'] != ""].empty:
+        last_wave = pivot_df[pivot_df['label'] != ""].iloc[-1]['label']
 
     ma_bull = df['ma20'].iloc[-1] > df['ma60'].iloc[-1] > df['ma120'].iloc[-1]
     macd_bull = df['macd'].iloc[-1] > df['signal'].iloc[-1]
@@ -148,12 +150,12 @@ def get_signal(pivot_df, df):
     elif last_wave == "C" and has_golden:
         return "黃金反轉", "C浪結束 + 完美斐波那契 → 強力買入", "lime"
     elif last_wave in ["1","2","3"] and trend_score >= 2:
-        return "強勢買入", "波浪結構＋趨勢共振"
+        return "強勢買入", "波浪結構 + 趨勢共振"
     else:
         status = "完美成立" if has_golden else "未通過"
         return "觀望", f"斐波那契驗證：{status}"
 
-# ==================== 主介面（已修好所有錯誤）===================
+# ==================== 主介面 ====================
 left_col, right_col = st.columns([1, 4])
 
 with left_col:
@@ -173,19 +175,21 @@ AMD
     deviation = st.slider("波浪靈敏度 (%)", 3.0, 10.0, 4.6, 0.1)
     run = st.button("啟動 五重共振掃盤", type="primary", use_container_width=True)
 
+# ==================== 執行分析 ====================
 if run:
     if not tickers:
-        st.error("請輸入股票代號")
+        st.error("請輸入至少一檔股票代號")
         st.stop()
 
     results = []
-    progress = st.progress(0
+    progress_bar = st.progress(0)   # 這行之前漏了括號，現在已修好！
 
-    for i, ticker in enumerate(tickers):
-        progress.progress((i+1)/len(tickers))
+    for idx, ticker in enumerate(tickers):
+        progress_bar.progress((idx + 1) / len(tickers))
+
         df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
         if len(df) < 100:
-            results.append({"代號": ticker, "訊號": "失敗", "原因": "資料不足"})
+            results.append({"代號=ticker, 訊號="失敗", 原因="資料不足"})
             continue
 
         df = df[['Open','High','Low','Close','Volume']].copy()
@@ -193,7 +197,7 @@ if run:
         df = add_indicators(df)
         pivot_df = zigzag(df, deviation)
         pivot_df = find_golden_wave(pivot_df)
-        signal, reason, color = get_signal(pivot_df, df)
+        signal, reason, _ = get_signal(pivot_df, df)
 
         # 畫圖
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
@@ -232,13 +236,14 @@ if run:
         })
 
     # 總表
-    df_res = pd.DataFrame(results)
-    styled = df_res.style.applymap(
-        lambda x: "background: gold; color: black; font-weight: bold" if "完美成立" in str(x) else "", 
-        subset=["斐波那契"]
-    )
-    st.dataframe(styled, use_container_width=True)
-    st.download_button("下載報告", df_res.to_csv(index=False).encode('utf-8-sig'), "艾略特終極報告.csv")
+    if results:
+        df_res = pd.DataFrame(results)
+        styled = df_res.style.applymap(
+            lambda x: "background: gold; color: black; font-weight: bold" if "完美成立" in str(x) else "",
+            subset=["斐波那契"]
+        )
+        st.dataframe(styled, use_container_width=True)
+        st.download_button("下載報告", df_res.to_csv(index=False).encode('utf-8-sig'), "艾略特終極報告.csv")
 
 else:
     st.success("全球最強艾略特波浪自動分析工具已就緒！\n只抓真正符合斐波那契黃金比例的完美波浪！")
