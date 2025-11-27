@@ -1,4 +1,4 @@
-# app.py —— 2025年11月 終極無敵版（MultiIndex 已修復）
+# v1.py —— 2025年11月 終極無敵版（MultiIndex + time 已修復）
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -6,29 +6,41 @@ import numpy as np
 from scipy.signal import argrelextrema
 import plotly.graph_objs as go
 import base64
+import time  # ← 關鍵修復：加 import time
 
 st.set_page_config(layout="wide", page_title="艾略特波浪偵測器")
 
-# ===================== 終極欄位處理（支援 MultiIndex）=====================
+# ===================== 終極欄位處理（安全版，防單層 Index）=====================
 def normalize_columns(df):
-    """完美處理 yfinance 所有變形，包括 MultiIndex"""
+    """完美處理 yfinance 所有變形，安全處理 MultiIndex/單層"""
     if df is None or df.empty:
         return None
     
     df = df.copy()
     
-    # 關鍵修復：如果 MultiIndex，扁平化
+    # 安全處理 MultiIndex（只在真正 MultiIndex 時處理）
     if isinstance(df.columns, pd.MultiIndex):
-        # 單股票時取第一層，MultiIndex 時扁平化
-        if len(df.columns.levels[0]) == 1:
-            df.columns = df.columns.droplevel(0)  # 移除 ticker 層級
-        else:
-            # 多股票：只取第一個 ticker 的欄位
-            first_ticker = df.columns.levels[0][0]
-            df = df[first_ticker].copy()
-            df.columns = df.columns.droplevel(0)
+        try:
+            # 單股票：移除 ticker 層級
+            if len(df.columns.levels[0]) == 1:
+                df.columns = df.columns.droplevel(0)
+            else:
+                # 多股票：取第一個 ticker
+                first_ticker = df.columns.levels[0][0]
+                df = df[first_ticker].copy()
+                df.columns = df.columns.droplevel(0)
+        except ValueError as e:
+            # 如果 droplevel 失敗（層級不匹配），強制重置為單層
+            if "Cannot remove 1 levels" in str(e):
+                # 假設是單股票，強制扁平化
+                df.columns = [col[1] if isinstance(col, tuple) else col for col in df.columns]
+            else:
+                raise e
+    else:
+        # 單層 Index，直接處理
+        pass
     
-    # 現在是普通 Index，處理大小寫
+    # 處理大小寫和變形
     cols = df.columns.astype(str).str.strip().str.lower()
     
     mapping = {}
@@ -40,7 +52,7 @@ def normalize_columns(df):
             mapping[old_col] = 'High'
         elif 'low' in lower:
             mapping[old_col] = 'Low'
-        elif 'close' in lower:
+        elif 'close' in lower or 'adj' in lower:
             mapping[old_col] = 'Close'
         elif 'volume' in lower:
             mapping[old_col] = 'Volume'
@@ -59,7 +71,7 @@ def normalize_columns(df):
     
     return df
 
-# ===================== 安全下載（單股票模式 + 重試）=====================
+# ===================== 安全下載（移除 group_by + 重試優化）=====================
 @st.cache_data(ttl=600, show_spinner=False)
 def get_data(ticker, interval="1d"):
     for attempt in range(3):
@@ -71,15 +83,14 @@ def get_data(ticker, interval="1d"):
             }
             period = period_map.get(interval, "2y")
             
-            # 關鍵：group_by='ticker' 避免 MultiIndex 問題
+            # 關鍵修復：移除 group_by='ticker'，改用單股票模式 + prepost=True 確保完整
             raw = yf.download(ticker, period=period, interval=interval,
-                              progress=False, auto_adjust=False, 
-                              group_by='ticker', threads=False)
+                              progress=False, auto_adjust=False, prepost=True, threads=False)
             
             if raw.empty or len(raw) < 20:
                 return None
                 
-            df = raw.reset_index() if not isinstance(raw.index, pd.MultiIndex) else raw
+            df = raw.reset_index()
             df = normalize_columns(df)
             if df is None:
                 return None
@@ -98,7 +109,7 @@ def get_data(ticker, interval="1d"):
         except Exception as e:
             if attempt == 2:
                 st.error(f"下載失敗 {ticker} {interval}: {str(e)[:100]}")
-            time.sleep(1)  # 稍等再試
+            time.sleep(1)  # ← 現在有 import，正常運作
             continue
     return None
 
@@ -244,11 +255,11 @@ if run_button:
         
         # 總結表
         st.header("📋 分析總結")
-        # 這裡可以加總結邏輯，暫時省略
+        # 可以加總結邏輯...
 
 else:
     st.info("👈 在左側設定參數後，點擊「開始分析」即可！")
 
 # 底部提示
 st.sidebar.markdown("---")
-st.sidebar.info("✅ 已修復 MultiIndex 錯誤\n✅ 支援 5m 高頻資料\n✅ 自動重試下載")
+st.sidebar.success("✅ 已修復 MultiIndex 層級錯誤\n✅ 已加 import time\n✅ 移除 group_by 避免不穩定")
