@@ -1,265 +1,368 @@
-# v1.py —— 2025年11月 終極無敵版（MultiIndex + time 已修復）
+# app.py - 專業版 Elliott Wave 多時間框架自動偵測器（2025 最新修訂版）
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
-import plotly.graph_objs as go
+import plotly.graph_objects as go
 import base64
-import time  # ← 關鍵修復：加 import time
+from datetime import datetime
 
-st.set_page_config(layout="wide", page_title="艾略特波浪偵測器")
+st.set_page_config(layout="wide", page_title="Elliott Wave Pro Detector", page_icon="Chart Increasing")
 
-# ===================== 終極欄位處理（安全版，防單層 Index）=====================
-def normalize_columns(df):
-    """完美處理 yfinance 所有變形，安全處理 MultiIndex/單層"""
-    if df is None or df.empty:
+# =========================
+# 核心指標函數
+# =========================
+def macd(series, fast=12, slow=26, signal=9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+def obv_trend_slope(df):
+    if len(df) < 10:
+        return "neutral"
+    x = np.arange(len(df))
+    slope = np.polyfit(x, df['OBV'].values, 1)[0]
+    return "up" if slope > 0 else "down"
+
+def ma_trend(close, short=50, long=200):
+    if len(close) < long:
         return None
-    
-    df = df.copy()
-    
-    # 安全處理 MultiIndex（只在真正 MultiIndex 時處理）
-    if isinstance(df.columns, pd.MultiIndex):
-        try:
-            # 單股票：移除 ticker 層級
-            if len(df.columns.levels[0]) == 1:
-                df.columns = df.columns.droplevel(0)
-            else:
-                # 多股票：取第一個 ticker
-                first_ticker = df.columns.levels[0][0]
-                df = df[first_ticker].copy()
-                df.columns = df.columns.droplevel(0)
-        except ValueError as e:
-            # 如果 droplevel 失敗（層級不匹配），強制重置為單層
-            if "Cannot remove 1 levels" in str(e):
-                # 假設是單股票，強制扁平化
-                df.columns = [col[1] if isinstance(col, tuple) else col for col in df.columns]
-            else:
-                raise e
-    else:
-        # 單層 Index，直接處理
-        pass
-    
-    # 處理大小寫和變形
-    cols = df.columns.astype(str).str.strip().str.lower()
-    
-    mapping = {}
-    for old_col in df.columns:
-        lower = str(old_col).strip().lower()
-        if 'open' in lower:
-            mapping[old_col] = 'Open'
-        elif 'high' in lower:
-            mapping[old_col] = 'High'
-        elif 'low' in lower:
-            mapping[old_col] = 'Low'
-        elif 'close' in lower or 'adj' in lower:
-            mapping[old_col] = 'Close'
-        elif 'volume' in lower:
-            mapping[old_col] = 'Volume'
-    
-    df = df.rename(columns=mapping)
-    
-    # 確保必要欄位
-    required = ['Open', 'High', 'Low', 'Close']
-    missing = [col for col in required if col not in df.columns]
-    if missing:
-        st.error(f"缺少欄位：{missing}。原始欄位：{list(df.columns)}")
-        return None
-    
-    if 'Volume' not in df.columns:
-        df['Volume'] = 0
-    
-    return df
+    return "bull" if close.rolling(short).mean().iloc[-1] > close.rolling(long).mean().iloc[-1] else "bear"
 
-# ===================== 安全下載（移除 group_by + 重試優化）=====================
-@st.cache_data(ttl=600, show_spinner=False)
-def get_data(ticker, interval="1d"):
-    for attempt in range(3):
-        try:
-            period_map = {
-                "1m": "7d", "2m": "7d", "5m": "7d", "15m": "60d",
-                "30m": "60d", "60m": "60d", "90m": "60d", "1d": "2y",
-                "1wk": "2y", "1mo": "2y"
-            }
-            period = period_map.get(interval, "2y")
-            
-            # 關鍵修復：移除 group_by='ticker'，改用單股票模式 + prepost=True 確保完整
-            raw = yf.download(ticker, period=period, interval=interval,
-                              progress=False, auto_adjust=False, prepost=True, threads=False)
-            
-            if raw.empty or len(raw) < 20:
-                return None
-                
-            df = raw.reset_index()
-            df = normalize_columns(df)
-            if df is None:
-                return None
-                
-            df = df.dropna(subset=['Close']).copy()
-            # 日期處理
-            date_col = 'Date' if 'Date' in df.columns else 'Datetime' if 'Datetime' in df.columns else None
-            if date_col:
-                df[date_col] = pd.to_datetime(df[date_col])
-                df = df.set_index(date_col)
-            else:
-                df.index = pd.to_datetime(df.index)
-                
-            return df.sort_index()
-            
-        except Exception as e:
-            if attempt == 2:
-                st.error(f"下載失敗 {ticker} {interval}: {str(e)[:100]}")
-            time.sleep(1)  # ← 現在有 import，正常運作
-            continue
-    return None
-
-# ===================== 找轉折點 =====================
-def find_pivots(series, order=6):
-    s = series.dropna()
-    if len(s) < order * 2 + 1:
-        return []
-    arr = s.values
-    highs = argrelextrema(arr, np.greater_equal, order=order)[0]
-    lows = argrelextrema(arr, np.less_equal, order=order)[0]
-    
+# =========================
+# 轉折點偵測
+# =========================
+def find_pivots(close_series, order=5):
+    highs = argrelextrema(close_series.values, np.greater_equal, order=order)[0]
+    lows = argrelextrema(close_series.values, np.less_equal, order=order)[0]
     pivots = []
     for i in highs:
-        pivots.append((s.index[i], float(s.iloc[i]), "peak"))
+        pivots.append((int(i), float(close_series.iloc[i]), "peak"))
     for i in lows:
-        pivots.append((s.index[i], float(s.iloc[i]), "trough"))
-    return sorted(pivots, key=lambda x: x[0])
+        pivots.append((int(i), float(close_series.iloc[i]), "trough"))
+    pivots.sort(key=lambda x: x[0])
+    return pivots
 
-# ===================== 五浪偵測 =====================
-def detect_impulse(pivots):
+def alternates(types):
+    return all(types[i] != types[i+1] for i in range(len(types)-1))
+
+# =========================
+# 5浪推進結構偵測（加強版）
+# =========================
+def detect_impulses(turning_points):
     impulses = []
-    n = len(pivots)
+    n = len(turning_points)
     for i in range(n - 5):
-        seq = pivots[i:i+6]
+        seq = turning_points[i:i+6]
         types = [p[2] for p in seq]
-        # 交替檢查
-        if any(types[j] == types[j+1] for j in range(5)):
+        if not alternates(types):
             continue
         prices = [p[1] for p in seq]
-        direction_up = prices[-1] > prices[0]
-        
-        peaks = [prices[j] for j in range(1, 6, 2)]  # 1,3,5
-        troughs = [prices[j] for j in range(2, 6, 2)]  # 2,4
-        
-        if len(peaks) < 2 or len(troughs) < 2:
-            continue
-            
-        # 單調檢查
-        peaks_mono = all(peaks[j] < peaks[j+1] for j in range(len(peaks)-1)) if direction_up else all(peaks[j] > peaks[j+1] for j in range(len(peaks)-1))
-        troughs_mono = all(troughs[j] < troughs[j+1] for j in range(len(troughs)-1)) if direction_up else all(troughs[j] > troughs[j+1] for j in range(len(troughs)-1))
-        
-        if peaks_mono and troughs_mono:
-            impulses.append(seq)
+        if prices[5] > prices[0]:  # 上漲5浪
+            peaks = prices[1::2]    # wave 2,4 低點
+            troughs = prices[::2]   # wave 1,3,5 高點
+            if len(peaks) >= 2 and len(troughs) >= 3:
+                if all(peaks[j] < peaks[j+1] for j in range(len(peaks)-1)) and \
+                   all(troughs[j] < troughs[j+1] for j in range(len(troughs)-1)):
+                    impulses.append(seq)
+        else:  # 下跌5浪
+            peaks = prices[1::2]
+            troughs = prices[::2]
+            if len(peaks) >= 2 and len(troughs) >= 3:
+                if all(peaks[j] > peaks[j+1] for j in range(len(peaks)-1)) and \
+                   all(troughs[j] > troughs[j+1] for j in range(len(troughs)-1)):
+                    impulses.append(seq)
     return impulses
 
-# ===================== 畫圖 =====================
-def plot_waves(df, pivots, impulses, title):
+# =========================
+# 關鍵鐵律：波浪4不可重疊波浪1 + 斐波那契驗證
+# =========================
+def validate_impulse_structure(seq):
+    if len(seq) != 6:
+        return False, "點數不足"
+    prices = [p[1] for p in seq]
+    w1_start, w1_end = prices[0], prices[1]
+    w4_start, w4_end = prices[3], prices[4]
+    direction = 1 if prices[5] > prices[0] else -1
+
+    # 鐵律：波浪4不能進入波浪1價格區域
+    wave1_zone = (min(w1_start, w1_end), max(w1_start, w1_end))
+    wave4_zone = (min(w4_start, w4_end), max(w4_start, w4_end))
+    if direction == 1:  # 上漲
+        if wave4_zone[0] < wave1_zone[1]:
+            return False, "違反規則：第4浪進入第1浪區域"
+    else:  # 下跌
+        if wave4_zone[1] > wave1_zone[0]:
+            return False, "違反規則：第4浪進入第1浪區域"
+
+    # 斐波那契比例（寬鬆版，至少3項通過）
+    w1 = abs(prices[1] - prices[0])
+    w2 = abs(prices[2] - prices[1])
+    w3 = abs(prices[3] - prices[2])
+    w4 = abs(prices[4] - prices[3])
+    w5 = abs(prices[5] - prices[4])
+
+    checks = [
+        0.30 <= w2 / (w1 + 1e-8) <= 0.80,   # 2浪回吐38%-78%
+        w3 >= 0.9 * w1,                     # 3浪通常最長（放寬）
+        0.15 <= w4 / (w3 + 1e-8) <= 0.50,   # 4浪回吐不超過50%
+        0.5 <= w5 / (w1 + 1e-8) <= 1.8      # 5浪常與1浪接近或延伸
+    ]
+    passed = sum(checks)
+    return passed >= 3, f"斐波那契通過 {passed}/4"
+
+# =========================
+# ABC修正波偵測（修正後取4點）
+# =========================
+def detect_abc_after_impulse(turning_points, impulse_seq):
+    end_idx = impulse_seq[-1][0]
+    indices = [tp[0] for tp in turning_points]
+    try:
+        pos = indices.index(end_idx)
+    except ValueError:
+        return None
+    if pos + 4 >= len(turning_points):
+        return None
+    abc_seq = turning_points[pos+1:pos+5]  # 4 points → A→B→C
+    types = [p[2] for p in abc_seq]
+    if len(types) < 4 or not alternates(types):
+        return None
+    # A浪應與第5浪反向
+    impulse_dir = "up" if impulse_seq[-1][1] > impulse_seq[0][1] else "down"
+    a_move_up = abc_seq[1][1] > abc_seq[0][1]
+    if (impulse_dir == "up" and a_move_up) or (impulse_dir == "down" and not a_move_up):
+        return None
+    return abc_seq
+
+# =========================
+# 投資建議引擎（加分數 + 星級）
+# =========================
+def get_suggestion(ticker, tf, impulse, abc, fib_ok, macd_hist_last, obv_trend, ma_trend):
+    score = 0
+    reasons = []
+
+    if impulse is None:
+        reasons.append("未偵測到完整5浪結構")
+        score -= 2
+    else:
+        if abc is not None:
+            reasons.append("已出現A-B-C修正波（趨勢可能轉折）")
+            score -= 2
+        # 修正中偏保守
+        else:
+            reasons.append("5浪結構已完成且無明顯修正（趨勢延續機率高）")
+            score += 3
+
+        reasons.append("通過波浪4不可重疊鐵律 + 斐波那契驗證" if fib_ok else "斐波那契比例未達標")
+        score += 2 if fib_ok else -1
+
+    # 技術指標加分
+    if macd_hist_last > 0:
+        reasons.append("MACD柱狀體為正（動能偏多）")
+        score += 1
+    else:
+        reasons.append("MACD柱狀體為負（動能偏空）")
+        score -= 1
+
+    if obv_trend == "up":
+        reasons.append("OBV上升（資金流入）")
+        score += 1
+    elif obv_trend == "down":
+        reasons.append("OBV下降（資金流出）")
+        score -= 1
+
+    if ma_trend == "bull":
+        reasons.append("50/200均線多頭排列（長期趨勢看多）")
+        score += 2
+    elif ma_trend == "bear":
+        reasons.append("50/200均線空頭排列（長期趨勢看空）")
+        score -= 2
+
+    # 最終判斷
+    if score >= 5:
+        sugg = "強力多頭 (Strong Buy)"
+        stars = "★★★★★"
+        color = "green"
+    elif score >= 2:
+        sugg = "多頭 (Buy)"
+        stars = "★★★★☆"
+        color = "lightgreen"
+    elif score <= -5:
+        sugg = "強力空頭 (Strong Sell)"
+        stars = "★☆☆☆☆"
+        color = "red"
+    elif score <= -2:
+        sugg = "空頭 (Sell)"
+        stars = "★★☆☆☆"
+        color = "orangered"
+    else:
+        sugg = "觀望 (Hold)"
+        stars = "★★★☆☆"
+        color = "gray"
+
+    "
+
+    explanation = f"### {ticker} {tf} → **<span style='color:{color}'>{sugg} {stars}</span>**\n\n"
+    explanation += "**判斷依據：**\n"
+    for r in reasons:
+        explanation += f"• {r}\n"
+    explanation += f"\n**綜合信心分數：{score} 分**"
+
+    return sugg, explanation, score, stars
+
+# =========================
+# 繪圖函數（標記最新價 + 美化）
+# =========================
+def plot_with_waves(df, pivots, valid_impulses, abc_seqs, title):
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'],
+    fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'],
                                  low=df['Low'], close=df['Close'], name="K線"))
-    
+
     # 轉折點
     if pivots:
-        px, py, ptypes = zip(*[(p[0], p[1], p[2]) for p in pivots])
-        colors = ['red' if t == 'peak' else 'blue' for t in ptypes]
-        fig.add_trace(go.Scatter(x=px, y=py, mode='markers',
-                                 marker=dict(size=8, color=colors), name='轉折點'))
-    
-    # 五浪（只畫最新一組，避免重疊）
-    if impulses:
-        seq = impulses[-1]
-        x = [p[0] for p in seq]
-        y = [p[1] for p in seq]
-        color = 'green' if y[-1] > y[0] else 'red'
-        fig.add_trace(go.Scatter(x=x, y=y, mode='lines+markers',
-                                 line=dict(width=4, color=color), name='五浪結構'))
-        
-        # 標註浪數
-        for i in range(5):
-            mx = x[i] + (x[i+1] - x[i]) / 2
-            my = y[i] + (y[i+1] - y[i]) * (0.6 if color == 'green' else 0.4)
-            fig.add_annotation(x=mx, y=my, text=str(i+1),
-                               font=dict(size=14, color="white"), 
-                               bgcolor=color, showarrow=False)
-    
-    fig.update_layout(title=title, height=600, template="plotly_white",
-                      xaxis_rangeslider_visible=False, xaxis_title="日期",
-                      yaxis_title="價格")
+        px = [df.iloc[p[0]]['Date'] for p in pivots]
+        py = [p[1] for p in pivots]
+        fig.add_trace(go.Scatter(x=px, y=py, mode='markers', marker=dict(size=8, color='yellow', symbol='circle'), name='轉折點'))
+
+    # 標記有效5浪
+    for seq in valid_impulses:
+        xs = [df.iloc[p[0]]['Date'] for p in seq]
+        ys = [p[1] for p in seq]
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode='lines+markers+text',
+                                 line=dict(width=4, color='royalblue'),
+                                 text=[f"W{i+1}" for i in range(6)],
+                                 textposition="top center",
+                                 name="5浪推進"))
+
+    # ABC修正波
+    for seq in abc_seqs:
+        xs = [df.iloc[p[0]]['Date'] for p in seq]
+        ys = [p[1] for p in seq]
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode='lines+markers',
+                                 line=dict(width=3, color='crimson', dash='dot'),
+                                 text=['A','B','C','?'], textposition="bottom center",
+                                 name="ABC修正"))
+
+    # 最新價格標記
+    latest_price = df['Close'].iloc[-1]
+    fig.add_hline(y=latest_price, line_dash="dot", line_color="white",
+                  annotation_text=f"最新價 {latest_price:.2f}", annotation_position="top right")
+
+    fig.update_layout(title=title, template="plotly_dark", height=650,
+                      xaxis_rangeslider_visible=False, showlegend=False)
     return fig
 
-# ===================== 主程式 =====================
-st.title("📊 艾略特波浪 多時間框架偵測器（2025 終極版）")
+# =========================
+# 下載連結
+# =========================
+def download_link(df, filename="elliott_report.csv"):
+    csv = df.to_csv(index=False).encode()
+    b64 = base64.b64encode(csv).decode()
+    return f'<a href="data:text/csv;base64,{b64}" download="{filename}">下載 {filename}</a>'
 
-st.sidebar.header("分析設定")
-tickers_input = st.sidebar.text_input("股票代號（逗號分隔）", "AAPL,TSLA,NVDA")
-timeframes = st.sidebar.multiselect("時間框架", ["5m", "15m", "60m", "1d"], default=["1d"])
-order = st.sidebar.slider("轉折點敏感度", min_value=3, max_value=15, value=6)
-run_button = st.sidebar.button("🚀 開始分析", type="primary")
+# =========================
+# Streamlit UI
+# =========================
+st.title("Elliott Wave Pro Detector - 專業艾略特波浪多時間框架掃描器")
+st.markdown("### 自動偵測 5浪推進 + ABC修正 + 嚴格鐵律驗證 + 多指標濾網")
 
-if run_button:
-    symbols = [s.strip().upper() for s in tickers_input.split(",") if s.strip()]
-    if not symbols:
-        st.warning("請輸入至少一個股票代號")
-    else:
-        for symbol in symbols:
-            st.header(f"🔎 分析 {symbol}")
-            cols = st.columns(len(timeframes))
-            for idx, (col, tf) in enumerate(zip(cols, timeframes)):
-                with col:
-                    st.subheader(f"{tf} 框架")
-                    with st.spinner(f"載入 {symbol} {tf} 資料..."):
-                        df = get_data(symbol, tf)
-                    if df is None or len(df) < 50:
-                        st.error(f"資料不足或下載失敗（{tf}）")
-                        continue
-                    
-                    # 計算轉折點與五浪
-                    pivots = find_pivots(df['Close'], order)
-                    impulses = detect_impulse(pivots)
-                    
-                    # 簡單指標
-                    ma_short = df['Close'].rolling(20).mean().iloc[-1]
-                    ma_long = df['Close'].rolling(50).mean().iloc[-1]
-                    ma_signal = "多頭" if ma_short > ma_long else "空頭"
-                    
-                    # 建議
-                    wave_score = len(impulses) * 2
-                    ma_score = 1 if ma_signal == "多頭" else -1
-                    total_score = wave_score + ma_score
-                    if total_score >= 3:
-                        suggestion = "🟢 強烈買入"
-                    elif total_score >= 1:
-                        suggestion = "🟡 輕度買入"
-                    elif total_score <= -1:
-                        suggestion = "🔴 賣出"
-                    else:
-                        suggestion = "⚪ 觀望"
-                    
-                    # 顯示
-                    st.metric("分析建議", suggestion)
-                    st.caption(f"偵測五浪數：{len(impulses)} | 均線訊號：{ma_signal} | 資料筆數：{len(df)}")
-                    
-                    # 圖表
-                    fig = plot_waves(df.tail(200), pivots, impulses, f"{symbol} {tf} - 艾略特波浪")
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    if st.checkbox(f"顯示轉折點細節 ({len(pivots)} 個)", key=f"detail_{symbol}_{tf}"):
-                        detail_df = pd.DataFrame(pivots, columns=['日期', '價格', '類型'])
-                        st.dataframe(detail_df.tail(10))
-            
-            st.markdown("---")
-        
-        # 總結表
-        st.header("📋 分析總結")
-        # 可以加總結邏輯...
+st.sidebar.header("設定參數")
+tickers_input = st.sidebar.text_input("股票代碼（多筆用逗號分隔）", value="AAPL, TSLA, NVDA, SPY, QQQ, BTC-USD")
+timeframes = st.sidebar.multiselect("時間框架", ["5m", "15m", "60m", "1d", "1wk"], default=["1d", "60m"])
+order = st.sidebar.slider("轉折點敏感度 (order)", 3, 15, 6)
+run = st.sidebar.button("開始掃描", type="primary")
 
+if run:
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+    results = []
+    progress = st.progress(0)
+    total = len(tickers) * len(timeframes)
+    step = 0
+
+    for ticker in tickers:
+        st.markdown(f"## {ticker}")
+        cols = st.columns(len(timeframes))
+        for idx, tf in enumerate(timeframes):
+            with cols[idx]:
+                st.subheader(tf)
+
+                period = "60d" if tf in ["5m", "15m"] else "2y" if tf == "1wk" else "1y"
+                try:
+                    df = yf.download(ticker, period=period, interval=tf, progress=False, auto_adjust=True)
+                except:
+                    st.error("下載失敗")
+                    continue
+                if df.empty or len(df) < 100:
+                    st.warning("資料不足")
+                    continue
+
+                df = df.reset_index()
+                df['Date'] = pd.to_datetime(df['Date'])
+                if 'Volume' not in df.columns:
+                    df['Volume'] = 0
+               
+
+                # 指標
+                df['OBV'] = obv(df) if df['Volume'].sum() > 0 else pd.Series(np.zeros(len(df)))
+                macd_line, signal_line, hist = macd(df['Close'])
+                df['MACD_hist'] = hist
+
+                # 偵測
+                pivots = find_pivots(df['Close'], order=order)
+                candidates = detect_impulses(pivots)
+                valid_impulses = []
+                abc_list = []
+
+                for seq in candidates:
+                    ok, msg = validate_impulse_structure(seq)
+                    if ok:
+                        valid_impulses.append(seq)
+                        abc = detect_abc_after_impulse(pivots, seq)
+                        if abc:
+                            abc_list.append(abc)
+
+                # 選最近完成的結構
+                impulse = max(valid_impulses, key=lambda x: x[-1][0]) if valid_impulses else None
+                abc = abc_list[-1] if abc_list else None
+                fib_ok = impulse is not None
+
+                # 建議
+                sugg, expl, score, stars = get_suggestion(
+                    ticker, tf, impulse, abc, fib_ok,
+                    df['MACD_hist'].iloc[-1],
+                    obv_trend_slope(df),
+                    ma_trend(df['Close'])
+                )
+
+                st.markdown(expl, unsafe_allow_html=True)
+                fig = plot_with_waves(df, pivots, valid_impulses, abc_list if abc else [], f"{ticker} {tf}")
+                st.plotly_chart(fig, use_container_width=True)
+
+                results.append({
+                    "時間": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "代碼": ticker,
+                    "週期": tf,
+                    "建議": sugg,
+                    "信心分數": score,
+                    "星級": stars,
+                    "5浪完成": "是" if impulse else "否",
+                    "ABC修正": "是" if abc else "否"
+                })
+
+            step += 1
+            progress.progress(step / total)
+
+    # 總表
+    if results:
+        summary = pd.DataFrame(results)
+        st.markdown("## 掃描總表")
+        st.dataframe(summary, use_container_width=True)
+        st.markdown(download_link(summary, f"elliott_scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"),
+                    unsafe_allow_html=True)
 else:
-    st.info("👈 在左側設定參數後，點擊「開始分析」即可！")
-
-# 底部提示
-st.sidebar.markdown("---")
-st.sidebar.success("✅ 已修復 MultiIndex 層級錯誤\n✅ 已加 import time\n✅ 移除 group_by 避免不穩定")
+    st.info("在左側設定股票與時間框架後，點擊「開始掃描」即可使用")
+    st.markdown("支援：美股、港股、台股加權、比特幣、黃金等 yfinance 涵蓋的所有標的")
